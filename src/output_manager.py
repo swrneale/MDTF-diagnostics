@@ -38,6 +38,7 @@ class HTMLSourceFileMixin():
         """
         return os.path.join(self.WK_DIR, '_MDTF_pod_output_temp.html')
 
+
     def html_src_file(self, file_name):
         """Returns full path to a framework-supplied html template *file_name*
         or other part of the output page.
@@ -60,7 +61,7 @@ class HTMLSourceFileMixin():
             os.path.join(self.WK_DIR, self.obj.name+".data.log"),
             'w', encoding='utf-8'
         )
-        if isinstance(self, HTMLPodOutputManager):
+        if isinstance(self, HTMLPodOutputManager) or isinstance(self, MultirunHTMLOutputManager):
             str_1 = f"POD {self.obj.name}"
             str_2 = 'this POD'
         elif isinstance(self, HTMLOutputManager):
@@ -79,6 +80,7 @@ class HTMLSourceFileMixin():
         assert hasattr(self.obj, '_out_file_log')
         log_file.write(self.obj._out_file_log.buffer_contents())
         log_file.close()
+
 
 class HTMLPodOutputManager(HTMLSourceFileMixin):
     """Performs cleanup tasks specific to a single POD when that POD has
@@ -176,7 +178,7 @@ class HTMLPodOutputManager(HTMLSourceFileMixin):
                 )
             except Exception as exc:
                 self.obj.log.error("%s produced malformed plot: %s",
-                    self.obj.full_name, f[len(abs_src_subdir):])
+                                   self.obj.full_name, f[len(abs_src_subdir):])
                 if isinstance(exc, util.MDTFCalledProcessError):
                     self.obj.log.debug(
                         "gs error encountered when converting %s for %s:\n%s",
@@ -260,6 +262,7 @@ class HTMLPodOutputManager(HTMLSourceFileMixin):
             self.convert_pod_figures(os.path.join('obs', 'PS'), 'obs')
             self.cleanup_pod_files()
 
+
 class HTMLOutputManager(AbstractOutputManager, HTMLSourceFileMixin):
     """OutputManager that collects the output of all PODs run as a part of *case*
     as html pages. Currently the only value for the OutputManager plugin, so it's
@@ -302,7 +305,7 @@ class HTMLOutputManager(AbstractOutputManager, HTMLSourceFileMixin):
         """
         template_d = html_templating_dict(pod)
         # add a warning banner if needed
-        assert hasattr(pod, '_banner_log')
+        assert(hasattr(pod, '_banner_log'))
         banner_str = pod._banner_log.buffer_contents()
         if banner_str:
             banner_str = banner_str.replace('\n', '<br>\n')
@@ -350,7 +353,7 @@ class HTMLOutputManager(AbstractOutputManager, HTMLSourceFileMixin):
         dest = os.path.join(self.WK_DIR, self._html_file_name)
         if os.path.isfile(dest):
             self.obj.log.warning("%s: '%s' exists, deleting.",
-                self._html_file_name, self.obj.name)
+                                 self._html_file_name, self.obj.name)
             os.remove(dest)
 
         template_dict = self.obj.env_vars.copy()
@@ -380,7 +383,7 @@ class HTMLOutputManager(AbstractOutputManager, HTMLSourceFileMixin):
                 out_file, _ = util.bump_version(out_file)
             elif os.path.exists(out_file):
                 self.obj.log.info("%s: Overwriting '%s'.",
-                    self.obj.full_name, out_file)
+                                  self.obj.full_name, out_file)
             util.write_json(config_tup.contents, out_file, log=self.obj.log)
 
     def make_tar_file(self):
@@ -406,12 +409,12 @@ class HTMLOutputManager(AbstractOutputManager, HTMLSourceFileMixin):
         if self.WK_DIR == self.OUT_DIR:
             return # no copying needed
         self.obj.log.debug("%s: Copy '%s' to '%s'.", self.obj.full_name,
-            self.WK_DIR, self.OUT_DIR)
+                           self.WK_DIR, self.OUT_DIR)
         try:
             if os.path.exists(self.OUT_DIR):
                 if not self.overwrite:
                     self.obj.log.error("%s: '%s' exists, overwriting.",
-                        self.obj.full_name, self.OUT_DIR)
+                                       self.obj.full_name, self.OUT_DIR)
                 shutil.rmtree(self.OUT_DIR)
         except Exception:
             raise
@@ -451,6 +454,119 @@ class HTMLOutputManager(AbstractOutputManager, HTMLSourceFileMixin):
             _ = self.make_tar_file()
         self.copy_to_output()
         if not self.obj.failed \
-            and not any(p.failed for p in self.obj.iter_children()):
+                and not any(p.failed for p in self.obj.iter_children()):
             self.obj.status = core.ObjectStatus.SUCCEEDED
+
+
+class MultirunHTMLOutputManager(HTMLOutputManager,
+                                AbstractOutputManager,
+                                HTMLSourceFileMixin):
+    """OutputManager that collects the output of all PODs run in multirun mode
+    as html pages.
+
+    Instantiates :class:`HTMLPodOutputManager` objects to handle processing the
+    output of each POD.
+    """
+    _PodOutputManagerClass = HTMLPodOutputManager
+    _html_file_name = 'index.html'
+
+    def __init__(self, pod):
+        config = core.ConfigManager()
+        try:
+            self.make_variab_tar = config['make_variab_tar']
+            self.dry_run = config['dry_run']
+            self.overwrite = config['overwrite']
+            self.file_overwrite = self.overwrite  # overwrite both config and .tar
+        except KeyError as exc:
+            self.log.exception("Caught %r", exc)
+
+        self.CODE_ROOT = pod._parent.code_root
+        self.WK_DIR = pod.POD_WK_DIR       # abbreviate
+        self.OUT_DIR = pod.POD_OUT_DIR     # abbreviate
+        self.obj = pod
+
+    def append_result_link(self, pod):
+        """Update the top level index.html page with a link to *pod*'s results.
+
+        This simply appends one of two html fragments to index.html:
+        ``src/html/pod_result_snippet.html`` if *pod* completed successfully,
+        or ``src/html/pod_error_snippet.html`` if an exception was raised during
+        *pod*'s setup or execution.
+        """
+        template_d = html_templating_dict(pod)
+        # add a warning banner if needed
+        assert(hasattr(pod, '_banner_log'))
+        banner_str = pod._banner_log.buffer_contents()
+        if banner_str:
+            banner_str = banner_str.replace('\n', '<br>\n')
+            src = self.html_src_file('warning_snippet.html')
+            template_d['MDTF_WARNING_BANNER_TEXT'] = banner_str
+            util.append_html_template(src, self.CASE_TEMP_HTML, template_d)
+
+        # put in the link to results
+        if pod.failed:
+            # report error
+            src = self.html_src_file('pod_error_snippet.html')
+            # template_d['error_text'] = pod.format_log(children=True)
+        else:
+            # normal exit
+            src = self.html_src_file('multirun_pod_result_snippet.html')
+        util.append_html_template(src, self.CASE_TEMP_HTML, template_d)
+
+    def make_output(self, pod):
+        """Top-level method for doing all output activity post-init. Spun into a
+        separate method to make subclassing easier.
+        """
+        # create empty text file for PODs to append to; equivalent of 'touch'
+        open(self.CASE_TEMP_HTML, 'w').close()
+        try:
+            pod_output = self._PodOutputManagerClass(pod, self)
+            pod_output.make_output()
+            if not pod.failed:
+                self.verify_pod_links(pod)
+        except Exception as exc:
+            pod.deactivate(exc)
+        try:
+            self.append_result_link(pod)  # problems here
+        except Exception as exc:
+            # won't go into the html output, but will be present in the
+            # summary for the case
+            pod.deactivate(exc)
+        pod.close_log_file(log=True)
+        if not pod.failed:
+            pod.status = core.ObjectStatus.SUCCEEDED
+
+        self.make_html()
+        self.backup_config_files()
+        self.write_data_log_file()
+        if self.make_variab_tar:
+            _ = self.make_tar_file()
+        self.copy_to_output()
+        if not self.obj.failed \
+                and not any(p.failed for p in self.obj.iter_children()):
+            self.obj.status = core.ObjectStatus.SUCCEEDED
+
+    def make_html(self, cleanup=True):
+        """Add header and footer to the temporary output file at CASE_TEMP_HTML.
+        """
+        dest = os.path.join(self.WK_DIR, self._html_file_name)
+        if os.path.isfile(dest):
+            self.obj.log.warning("%s: '%s' exists, deleting.",
+                                 self._html_file_name, self.obj.name)
+            os.remove(dest)
+
+        template_dict = self.obj.pod_env_vars.copy()
+        template_dict['DATE_TIME'] = \
+            datetime.datetime.utcnow().strftime("%A, %d %B %Y %I:%M%p (UTC)")
+        template_dict['PODNAME'] = self.obj.name
+        util.append_html_template(
+            self.html_src_file('mdtf_multirun_header.html'), dest, template_dict
+        )
+        util.append_html_template(self.CASE_TEMP_HTML, dest, {})
+        util.append_html_template(
+            self.html_src_file('mdtf_footer.html'), dest, template_dict
+        )
+        if cleanup:
+            os.remove(self.CASE_TEMP_HTML)
+        shutil.copy2(self.html_src_file('mdtf_diag_banner.png'), self.WK_DIR)
 
